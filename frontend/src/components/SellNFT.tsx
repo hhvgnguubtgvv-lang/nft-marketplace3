@@ -1,8 +1,7 @@
-
 import React, { useState } from 'react';
 import { ethers } from 'ethers';
-import { CONTRACT_ADDRESSES, PAYMENT_TOKEN } from '../utils/constants';
-import { ERC721_ABI } from '../utils/contracts';
+import { CONTRACT_ADDRESSES, PAYMENT_TOKEN, NFT_CONTRACT } from '../utils/constants';
+import { ERC721_ABI, MARKETPLACE_ABI } from '../utils/marketplaceABI';
 
 declare global {
   interface Window {
@@ -10,19 +9,16 @@ declare global {
   }
 }
 
-const SellNFT: React.FC = () => {
-  const [nftContract, setNftContract] = useState('');
+interface SellNFTProps {
+  onListingCreated?: () => void;
+}
+
+const SellNFT: React.FC<SellNFTProps> = ({ onListingCreated }) => {
   const [tokenId, setTokenId] = useState('');
   const [price, setPrice] = useState('');
   const [loading, setLoading] = useState(false);
   const [account, setAccount] = useState('');
-
-  // ABI для вызова через DirectListings extension
-  const DIRECT_LISTINGS_ABI = [
-    // Основная функция создания листинга
-    "function createListing((address assetContract, uint256 tokenId, uint256 quantity, address currency, uint256 pricePerToken, uint128 startTimestamp, uint128 endTimestamp, bool reserved) _params) external returns (uint256 listingId)",
-    "function totalListings() external view returns (uint256)"
-  ];
+  const [status, setStatus] = useState<string>('');
 
   const connectWallet = async () => {
     if (!window.ethereum) {
@@ -35,13 +31,13 @@ const SellNFT: React.FC = () => {
         method: 'eth_requestAccounts' 
       });
       setAccount(accounts[0]);
-      alert(`Кошелек подключен: ${accounts[0].slice(0, 6)}...${accounts[0].slice(-4)}`);
+      setStatus('✅ Кошелек подключен');
     } catch (error) {
       alert('Ошибка подключения кошелька: ' + error);
     }
   };
 
-  const createListing = async () => {
+  const listNFT = async () => {
     if (!window.ethereum) {
       alert('MetaMask не установлен!');
       return;
@@ -52,87 +48,105 @@ const SellNFT: React.FC = () => {
       return;
     }
 
-    if (!nftContract || !tokenId || !price) {
+    if (!tokenId || !price) {
       alert('Заполните все поля!');
       return;
     }
 
+    // Проверяем что цена адекватная
+    const priceNumber = parseFloat(price);
+    if (priceNumber <= 0) {
+      alert('Цена должна быть больше 0');
+      return;
+    }
+
+    if (priceNumber > 1000000) {
+      alert('Цена слишком большая');
+      return;
+    }
+
     setLoading(true);
+    setStatus('🔄 Начинаем процесс листинга...');
+
     try {
       const provider = new ethers.BrowserProvider(window.ethereum);
       const signer = await provider.getSigner();
-      
       const marketplaceAddress = CONTRACT_ADDRESSES[137];
       
-      console.log('🔍 Начинаем процесс продажи...');
-
       // 1. Проверяем владение NFT
-      const nft = new ethers.Contract(nftContract, ERC721_ABI, signer);
-      console.log('🔍 Проверяем владение NFT...');
+      setStatus('🔍 Проверяем владение NFT...');
+      const nft = new ethers.Contract(NFT_CONTRACT, ERC721_ABI, signer);
       
-      const owner = await nft.ownerOf(tokenId);
-      if (owner.toLowerCase() !== account.toLowerCase()) {
-        alert('❌ Вы не владелец этого NFT!');
-        return;
+      try {
+        const owner = await nft.ownerOf(tokenId);
+        if (owner.toLowerCase() !== account.toLowerCase()) {
+          throw new Error(`Вы не владелец этого NFT! Владелец: ${owner}`);
+        }
+        setStatus('✅ Владение подтверждено');
+      } catch (error: any) {
+        if (error.message.includes('nonexistent token')) {
+          throw new Error(`NFT с ID ${tokenId} не существует!`);
+        }
+        throw error;
       }
-      console.log('✅ Владение подтверждено');
 
       // 2. Даем разрешение маркетплейсу
-      console.log('🔐 Даем разрешение маркетплейсу...');
+      setStatus('🔐 Даем разрешение маркетплейсу...');
       const isApproved = await nft.isApprovedForAll(account, marketplaceAddress);
       
       if (!isApproved) {
-        console.log('⏳ Отправляем транзакцию approve...');
+        setStatus('📝 Отправляем транзакцию разрешения...');
         const approveTx = await nft.setApprovalForAll(marketplaceAddress, true);
+        setStatus(`⏳ Ждем подтверждения разрешения... ${approveTx.hash}`);
         await approveTx.wait();
-        console.log('✅ Разрешение дано');
+        setStatus('✅ Разрешение подтверждено');
       } else {
-        console.log('✅ Разрешение уже есть');
+        setStatus('✅ Разрешение уже есть');
       }
 
-      // 3. Пробуем разные способы вызова:
+      // 3. Выставляем NFT на продажу
+      setStatus('💰 Создаем листинг...');
+      const marketplace = new ethers.Contract(marketplaceAddress, MARKETPLACE_ABI, signer);
       
-      // Способ A: Прямой вызов через основной контракт с правильным ABI
-      console.log('🔄 Способ A: Прямой вызов...');
-      const marketplaceABI = [
-        "function createListing(tuple(address assetContract, uint256 tokenId, uint256 quantity, address currency, uint256 pricePerToken, uint128 startTimestamp, uint128 endTimestamp, bool reserved) _params) external returns (uint256 listingId)"
-      ];
+      // Конвертируем цену в wei
+      const priceInWei = ethers.parseUnits(price, PAYMENT_TOKEN.decimals);
       
-      const marketplace = new ethers.Contract(marketplaceAddress, marketplaceABI, signer);
-      
-      const listingParams = {
-        assetContract: nftContract,
+      console.log('💰 Данные листинга:', {
+        nftContract: NFT_CONTRACT,
         tokenId: tokenId,
-        quantity: 1,
-        currency: PAYMENT_TOKEN.address,
-        pricePerToken: ethers.parseUnits(price, 18),
-        startTimestamp: Math.floor(Date.now() / 1000),
-        endTimestamp: Math.floor(Date.now() / 1000) + (60 * 60 * 24 * 30), // 30 дней
-        reserved: false
-      };
+        price: price,
+        priceInWei: priceInWei.toString(),
+        priceBack: ethers.formatUnits(priceInWei, PAYMENT_TOKEN.decimals)
+      });
 
-      console.log('📤 Параметры листинга:', listingParams);
-      
-      // Пробуем отправить с большим лимитом газа
-      const tx = await marketplace.createListing(listingParams, {
-        gasLimit: 500000 // Увеличиваем лимит газа
+      setStatus(`📤 Отправляем транзакцию листинга...`);
+      const listTx = await marketplace.listNFT(NFT_CONTRACT, tokenId, priceInWei, {
+        gasLimit: 300000
       });
       
-      console.log('📫 Транзакция отправлена:', tx.hash);
-      alert(`✅ Транзакция отправлена!\nХэш: ${tx.hash}\n\nЖдем подтверждения...`);
+      setStatus(`⏳ Транзакция отправлена! Ждем подтверждения... ${listTx.hash}`);
+      console.log('📫 Транзакция листинга:', listTx);
       
-      const receipt = await tx.wait();
-      console.log('🎉 Транзакция подтверждена:', receipt);
+      // Ждем подтверждения
+      const receipt = await listTx.wait();
+      console.log('✅ Транзакция подтверждена:', receipt);
       
-      alert(`🎉 NFT успешно выставлен на продажу за ${price} ${PAYMENT_TOKEN.symbol}!`);
+      setStatus('🎉 NFT успешно выставлен на продажу!');
+
+      alert(`🎉 NFT выставлен на продажу!\n\n✅ Token ID: ${tokenId}\n💰 Цена: ${price} LEX\n\nТеперь он появится в разделе "Buy NFTs"`);
 
       // Сброс формы
-      setNftContract('');
       setTokenId('');
       setPrice('');
 
+      // Уведомляем родительский компонент
+      if (onListingCreated) {
+        onListingCreated();
+      }
+
     } catch (error: any) {
       console.error('❌ Ошибка:', error);
+      setStatus(`❌ Ошибка: ${error.message}`);
       
       if (error.message?.includes('user rejected')) {
         alert('❌ Вы отменили транзакцию');
@@ -140,11 +154,8 @@ const SellNFT: React.FC = () => {
         alert('❌ Недостаточно MATIC для комиссии');
       } else if (error.reason) {
         alert(`❌ Ошибка: ${error.reason}`);
-      } else if (error.data?.message) {
-        alert(`❌ Ошибка: ${error.data.message}`);
       } else {
-        // Показываем более детальную информацию об ошибке
-        alert(`❌ Транзакция не удалась. Возможные причины:\n\n1. Контракт требует вызов через определенный модуль\n2. Неправильные параметры функции\n3. Контракт не активирован\n\nПопробуйте через ThirdWeb Dashboard: https://thirdweb.com/`);
+        alert(`❌ Ошибка: ${error.message || 'Неизвестная ошибка'}`);
       }
     } finally {
       setLoading(false);
@@ -176,30 +187,20 @@ const SellNFT: React.FC = () => {
         <>
           <div style={{ background: '#d4edda', padding: '15px', borderRadius: '5px', marginBottom: '20px' }}>
             <p>✅ <strong>Кошелек подключен:</strong> {account.slice(0, 6)}...{account.slice(-4)}</p>
-            <p>🏪 <strong>Маркетплейс:</strong> {CONTRACT_ADDRESSES[137]?.slice(0, 10)}...</p>
-            <p>💡 <strong>Статус:</strong> Контракт отвечает (1 листинг)</p>
+            <p>🖼️ <strong>NFT Контракт:</strong> {NFT_CONTRACT.slice(0, 6)}...{NFT_CONTRACT.slice(-4)}</p>
+            <p>💰 <strong>Токен оплаты:</strong> {PAYMENT_TOKEN.symbol}</p>
           </div>
           
           <div style={{ marginBottom: '15px' }}>
-            <label style={{ display: 'block', marginBottom: '5px', fontWeight: 'bold' }}>Адрес контракта NFT:</label>
-            <input
-              type="text"
-              placeholder="0x..."
-              value={nftContract}
-              onChange={(e) => setNftContract(e.target.value)}
-              style={{ width: '100%', padding: '10px', border: '1px solid #ddd', borderRadius: '4px', fontSize: '16px' }}
-            />
-          </div>
-          
-          <div style={{ marginBottom: '15px' }}>
-            <label style={{ display: 'block', marginBottom: '5px', fontWeight: 'bold' }}>ID токена:</label>
+            <label style={{ display: 'block', marginBottom: '5px', fontWeight: 'bold' }}>ID токена NFT:</label>
             <input
               type="number"
-              placeholder="123"
+              placeholder="1"
               value={tokenId}
               onChange={(e) => setTokenId(e.target.value)}
               style={{ width: '100%', padding: '10px', border: '1px solid #ddd', borderRadius: '4px', fontSize: '16px' }}
             />
+            <small style={{ color: '#666' }}>Введите ID NFT который хотите продать</small>
           </div>
           
           <div style={{ marginBottom: '20px' }}>
@@ -209,42 +210,50 @@ const SellNFT: React.FC = () => {
               placeholder="100"
               value={price}
               onChange={(e) => setPrice(e.target.value)}
-              min="0"
+              min="0.001"
               step="0.001"
               style={{ width: '100%', padding: '10px', border: '1px solid #ddd', borderRadius: '4px', fontSize: '16px' }}
             />
+            <small style={{ color: '#666' }}>Например: 100, 50.5, 0.1</small>
           </div>
           
           <button 
-            onClick={createListing} 
-            disabled={!nftContract || !tokenId || !price || loading}
+            onClick={listNFT} 
+            disabled={!tokenId || !price || loading}
             style={{ 
               width: '100%', 
               padding: '15px', 
-              backgroundColor: (!nftContract || !tokenId || !price || loading) ? '#6c757d' : '#28a745',
+              backgroundColor: (!tokenId || !price || loading) ? '#6c757d' : '#28a745',
               color: 'white',
               border: 'none',
               borderRadius: '5px',
               fontSize: '18px',
               fontWeight: 'bold',
-              cursor: (!nftContract || !tokenId || !price || loading) ? 'not-allowed' : 'pointer'
+              cursor: (!tokenId || !price || loading) ? 'not-allowed' : 'pointer'
             }}
           >
-            {loading ? '⏳ Выставляем на продажу...' : `🎯 Выставить за ${price} ${PAYMENT_TOKEN.symbol}`}
+            {loading ? '⏳ Создаем листинг...' : `🎯 Выставить за ${price} ${PAYMENT_TOKEN.symbol}`}
           </button>
 
-          <div style={{ marginTop: '20px', padding: '15px', background: '#fff3cd', borderRadius: '5px' }}>
-            <h4 style={{ marginTop: 0 }}>💡 Рекомендация:</h4>
-            <p>Если транзакция продолжает откатываться, попробуйте создать листинг через ThirdWeb Dashboard:</p>
-            <a 
-              href={`https://thirdweb.com/polygon/${CONTRACT_ADDRESSES[137]}/direct-listings`}
-              target="_blank"
-              rel="noopener noreferrer"
-              style={{ color: '#007bff', textDecoration: 'underline' }}
-            >
-              Открыть ThirdWeb Dashboard →
-            </a>
-          </div>
+          {status && (
+            <div style={{ 
+              marginTop: '20px', 
+              padding: '15px', 
+              background: status.includes('❌') ? '#f8d7da' : 
+                         status.includes('✅') ? '#d1ecf1' : 
+                         status.includes('🎉') ? '#d4edda' : '#fff3cd',
+              color: status.includes('❌') ? '#721c24' : 
+                     status.includes('✅') ? '#0c5460' : 
+                     status.includes('🎉') ? '#155724' : '#856404',
+              borderRadius: '5px',
+              textAlign: 'center',
+              border: status.includes('❌') ? '1px solid #f5c6cb' : 
+                      status.includes('✅') ? '1px solid #bee5eb' : 
+                      status.includes('🎉') ? '1px solid #c3e6cb' : '1px solid #ffeaa7'
+            }}>
+              {status}
+            </div>
+          )}
         </>
       )}
     </div>
